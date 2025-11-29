@@ -32,7 +32,9 @@ jobs:
 
       - name: Build EXE with PyInstaller (onedir, GUI)
         run: |
-          pyinstaller --noconfirm --clean --onedir --windowed --exclude-module sklearn --name AudioEnvelopeTransferGUI app.py
+          pyinstaller --noconfirm --clean --onedir --windowed --name AudioEnvelopeTransferGUI ^
+            --hidden-import sklearn --hidden-import sklearn.decomposition ^
+            app.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
