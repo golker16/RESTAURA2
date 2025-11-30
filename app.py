@@ -84,7 +84,6 @@ def extract_pitch_voicing_and_env(
     f0_smooth_alpha: float,
     gate_unvoiced: bool,
 ):
-    # Pitch tracking
     f0, voiced_flag, voiced_prob = lr_pyin(
         y,
         fmin=lr_note_to_hz(FMIN_NOTE),
@@ -100,7 +99,6 @@ def extract_pitch_voicing_and_env(
     if len(valid) == 0:
         raise RuntimeError("No se pudo detectar pitch (F0) en el audio fuente.")
 
-    # Rellenar NaNs para continuidad (el gate luego decide si suena)
     f0_clean = f0.copy()
     last = f0_clean[valid[0]]
     for i in range(len(f0_clean)):
@@ -109,12 +107,18 @@ def extract_pitch_voicing_and_env(
         else:
             last = f0_clean[i]
 
-    # Suavizar F0 para evitar “temblor”/vibrato raro
+    # Suavizar F0
     f0_clean = one_pole_smooth(f0_clean, alpha=f0_smooth_alpha)
 
-    # Envelope por RMS
+    # Envelope RMS
     env = frame_rms(y, frame_length=frame_length, hop_length=hop_length)
     env = env / (np.max(env) + 1e-12)
+
+    # ✅ ALIGN: igualar número de frames (pyin vs rms)
+    n = min(len(f0_clean), len(voiced), len(env))
+    f0_clean = f0_clean[:n]
+    voiced = voiced[:n]
+    env = env[:n]
 
     if gate_unvoiced:
         env = env * voiced.astype(float)
@@ -499,4 +503,3 @@ if __name__ == "__main__":
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
-
