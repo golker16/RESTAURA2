@@ -1,4 +1,6 @@
 import sys
+import os
+import tempfile
 import numpy as np
 import soundfile as sf
 
@@ -7,7 +9,10 @@ from librosa.core.audio import load as lr_load
 from librosa.core.pitch import pyin as lr_pyin
 from librosa.core.convert import note_to_hz as lr_note_to_hz, hz_to_midi as lr_hz_to_midi
 
-from PySide6.QtCore import QObject, QThread, Signal, Qt
+from PySide6.QtCore import QObject, QThread, Signal, Qt, QUrl
+from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
+
 from PySide6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -23,11 +28,15 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QSpacerItem,
     QSizePolicy,
-    QComboBox,
     QSpinBox,
     QDoubleSpinBox,
     QCheckBox,
+    QListWidget,
+    QListWidgetItem,
+    QSplitter,
+    QGroupBox,
 )
+
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
@@ -42,6 +51,9 @@ DEFAULT_HOP_LENGTH = 256
 
 WT_FRAME_SIZE = 2048
 WT_MIP_LEVELS = 8
+
+# Tu carpeta fija (pero puedes cambiarla en la UI también)
+WT_DIR_DEFAULT = r"D:\WAVETABLE"
 
 
 # ----------------- WAVETABLE (drop-in) -----------------
@@ -136,7 +148,7 @@ def build_wavetable_mipmaps(frames: np.ndarray, levels: int = WT_MIP_LEVELS):
     cur = frames
     cur_size = frame_size
 
-    for lvl in range(levels):
+    for _lvl in range(levels):
         mipmaps.append(cur)
 
         next_size = max(32, cur_size // 2)
@@ -215,7 +227,6 @@ def render_wavetable_osc(
         t0 = tables_L[f0i]
         t1 = tables_L[f1i]
         table = _lerp(t0, t1, ft)
-
         out[mask] = _table_read_linear(table, phase[mask])
 
     return out, float(ph)
@@ -258,7 +269,7 @@ def synth_wavetable_from_f0_env(
     return out
 
 
-# ----------------- DSP -----------------
+# ----------------- DSP (analysis) -----------------
 
 def load_mono(path: str):
     y, sr = lr_load(path, sr=None, mono=True)
@@ -329,6 +340,7 @@ def extract_pitch_voicing_and_env(
     env = frame_rms(y, frame_length=frame_length, hop_length=hop_length)
     env = env / (np.max(env) + 1e-12)
 
+    # ✅ ALIGN
     n = min(len(f0_clean), len(voiced), len(env))
     f0_clean = f0_clean[:n]
     voiced = voiced[:n]
@@ -407,7 +419,7 @@ class AudioWorker(QObject):
             self.log.emit("Procesando: Pitch map + Envelope → Wavetable Synth")
 
             if not self.wavetable_path:
-                raise RuntimeError("Selecciona un archivo WAV de wavetable antes de procesar.")
+                raise RuntimeError("Selecciona un WAV para el wavetable.")
 
             self.progress.emit(5)
             self.log.emit("Cargando audio fuente...")
@@ -471,13 +483,63 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Pitch+Envelope Wavetable Synth (sin sklearn)")
-        self.resize(1020, 720)
+        self.resize(1180, 740)
+
+        # player preview
+        self._audio_output = QAudioOutput()
+        self._player = QMediaPlayer()
+        self._player.setAudioOutput(self._audio_output)
+        self._preview_tmp_path = None
+
+        # wavetable cache
+        self._wt_cache_path = None
+        self._wt_cache_mipmaps = None
 
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(10)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(10, 10, 10, 10)
+
+        splitter = QSplitter(Qt.Horizontal)
+        outer.addWidget(splitter)
+
+        # ---------- LEFT: Browser ----------
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(10, 10, 10, 10)
+        left_layout.setSpacing(8)
+
+        gb = QGroupBox("Wavetable Browser")
+        gb_l = QVBoxLayout(gb)
+
+        self.wt_dir_edit = QLineEdit(WT_DIR_DEFAULT)
+        self.wt_dir_edit.setPlaceholderText(r"Carpeta de wavetables (ej: D:\WAVETABLE)")
+        btn_choose_dir = QPushButton("Cambiar carpeta…")
+        btn_refresh = QPushButton("Refrescar")
+        dir_row = QHBoxLayout()
+        dir_row.addWidget(self.wt_dir_edit, stretch=1)
+        dir_row.addWidget(btn_choose_dir)
+        dir_row.addWidget(btn_refresh)
+        gb_l.addLayout(dir_row)
+
+        self.wt_filter = QLineEdit()
+        self.wt_filter.setPlaceholderText("Filtrar (texto)…")
+        gb_l.addWidget(self.wt_filter)
+
+        self.wt_list = QListWidget()
+        gb_l.addWidget(self.wt_list, stretch=1)
+
+        btn_preview = QPushButton("Preview (P)")
+        gb_l.addWidget(btn_preview)
+
+        left_layout.addWidget(gb, stretch=1)
+        splitter.addWidget(left)
+
+        # ---------- RIGHT: Main panel ----------
+        right = QWidget()
+        r = QVBoxLayout(right)
+        r.setContentsMargins(10, 10, 10, 10)
+        r.setSpacing(10)
 
         # Paths
         self.src_edit = QLineEdit()
@@ -507,9 +569,9 @@ class MainWindow(QMainWindow):
         row_out.addWidget(self.out_edit)
         row_out.addWidget(btn_out)
 
-        layout.addLayout(row_src)
-        layout.addLayout(row_wt)
-        layout.addLayout(row_out)
+        r.addLayout(row_src)
+        r.addLayout(row_wt)
+        r.addLayout(row_out)
 
         # Controls
         controls = QHBoxLayout()
@@ -574,34 +636,187 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.wt_mip)
 
         controls.addStretch()
-        layout.addLayout(controls)
+        r.addLayout(controls)
 
         # Process button
         self.btn_process = QPushButton("Procesar (wavetable)")
         self.btn_process.clicked.connect(self.start_processing)
-        layout.addWidget(self.btn_process)
+        r.addWidget(self.btn_process)
 
         # Progress + Plot + Logs
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        layout.addWidget(self.progress)
+        r.addWidget(self.progress)
 
         self.pitch_canvas = PitchPlotCanvas(self)
-        layout.addWidget(self.pitch_canvas)
+        r.addWidget(self.pitch_canvas)
 
         self.logs = QTextEdit()
         self.logs.setReadOnly(True)
-        layout.addWidget(self.logs, stretch=1)
+        r.addWidget(self.logs, stretch=1)
 
-        layout.addItem(QSpacerItem(0, 10, QSizePolicy.Minimum, QSizePolicy.Expanding))
+        r.addItem(QSpacerItem(0, 10, QSizePolicy.Minimum, QSizePolicy.Expanding))
         footer = QLabel("© 2025 Gabriel Golker")
         footer.setAlignment(Qt.AlignCenter)
-        layout.addWidget(footer)
+        r.addWidget(footer)
 
-        self.thread = None
-        self.worker = None
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
 
+        # Signals browser
+        btn_choose_dir.clicked.connect(self.choose_wt_dir)
+        btn_refresh.clicked.connect(self.refresh_wavetables)
+        self.wt_filter.textChanged.connect(self.refresh_wavetables)
+        self.wt_list.itemSelectionChanged.connect(self.on_wt_selected)
+        self.wt_list.itemDoubleClicked.connect(lambda _item: self.preview_selected_wavetable())
+        btn_preview.clicked.connect(self.preview_selected_wavetable)
+
+        # Shortcut P
+        self._shortcut_preview = QShortcut(QKeySequence("P"), self)
+        self._shortcut_preview.activated.connect(self.preview_selected_wavetable)
+
+        # initial fill
+        self.refresh_wavetables()
+
+    # ---------- helpers ----------
+    def log(self, msg: str):
+        self.logs.append(msg)
+
+    def _safe_list_wavs(self, folder: str):
+        try:
+            names = []
+            for entry in os.listdir(folder):
+                if entry.lower().endswith(".wav"):
+                    names.append(entry)
+            names.sort(key=lambda s: s.lower())
+            return names
+        except Exception:
+            return []
+
+    def _load_mipmaps_cached(self, wavetable_path: str):
+        wavetable_path = os.path.abspath(wavetable_path)
+        if self._wt_cache_path == wavetable_path and self._wt_cache_mipmaps is not None:
+            return self._wt_cache_mipmaps
+
+        frames = load_wavetable_wav(wavetable_path, frame_size=WT_FRAME_SIZE)
+        mipmaps = build_wavetable_mipmaps(frames, levels=WT_MIP_LEVELS)
+        self._wt_cache_path = wavetable_path
+        self._wt_cache_mipmaps = mipmaps
+        return mipmaps
+
+    # ---------- Browser ----------
+    def choose_wt_dir(self):
+        start = self.wt_dir_edit.text().strip() or WT_DIR_DEFAULT
+        folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta de wavetables", start)
+        if folder:
+            self.wt_dir_edit.setText(folder)
+            self.refresh_wavetables()
+
+    def refresh_wavetables(self):
+        folder = self.wt_dir_edit.text().strip()
+        flt = self.wt_filter.text().strip().lower()
+
+        self.wt_list.clear()
+
+        if not folder or not os.path.isdir(folder):
+            self.wt_list.addItem(QListWidgetItem("(Carpeta no encontrada)"))
+            return
+
+        files = self._safe_list_wavs(folder)
+        if flt:
+            files = [f for f in files if flt in f.lower()]
+
+        if not files:
+            self.wt_list.addItem(QListWidgetItem("(No hay WAVs / filtro sin resultados)"))
+            return
+
+        for f in files:
+            self.wt_list.addItem(QListWidgetItem(f))
+
+    def on_wt_selected(self):
+        folder = self.wt_dir_edit.text().strip()
+        items = self.wt_list.selectedItems()
+        if not items or not folder or not os.path.isdir(folder):
+            return
+
+        name = items[0].text()
+        if name.startswith("("):
+            return
+
+        full = os.path.join(folder, name)
+        self.wt_edit.setText(full)
+
+        # Invalida cache si cambia
+        if self._wt_cache_path != os.path.abspath(full):
+            self._wt_cache_path = None
+            self._wt_cache_mipmaps = None
+
+    # ---------- Preview (P) ----------
+    def preview_selected_wavetable(self):
+        wt_path = self.wt_edit.text().strip()
+        if not wt_path or not os.path.isfile(wt_path):
+            QMessageBox.warning(self, "Preview", "Selecciona un wavetable WAV válido.")
+            return
+
+        try:
+            mipmaps = self._load_mipmaps_cached(wt_path)
+
+            # preview: 2.0s a 44.1k, nota A3 (220Hz)
+            sr = 44100
+            dur = 2.0
+            n = int(sr * dur)
+
+            f0 = np.full(n, 220.0, dtype=np.float32)
+
+            pos = float(self.wt_pos.value())
+            mip = float(self.wt_mip.value())
+
+            osc, _ = render_wavetable_osc(
+                f0_hz=f0,
+                sr=sr,
+                mipmaps=mipmaps,
+                position=pos,
+                phase0=0.0,
+                mip_strength=mip,
+            )
+
+            # envelope simple para evitar clicks
+            env = np.ones(n, dtype=np.float32)
+            fade = int(0.02 * sr)  # 20ms
+            if fade > 0 and 2 * fade < n:
+                ramp = np.linspace(0.0, 1.0, fade, dtype=np.float32)
+                env[:fade] = ramp
+                env[-fade:] = ramp[::-1]
+
+            out = np.clip(osc * env * 0.35, -1.0, 1.0).astype(np.float32)
+
+            # escribir a temp y reproducir con QMediaPlayer
+            fd, tmp_path = tempfile.mkstemp(prefix="wt_preview_", suffix=".wav")
+            os.close(fd)
+            sf.write(tmp_path, out, sr)
+
+            # limpiar anterior
+            if self._preview_tmp_path and os.path.isfile(self._preview_tmp_path):
+                try:
+                    os.remove(self._preview_tmp_path)
+                except Exception:
+                    pass
+            self._preview_tmp_path = tmp_path
+
+            self._player.stop()
+            self._player.setSource(QUrl.fromLocalFile(tmp_path))
+            self._audio_output.setVolume(1.0)
+            self._player.play()
+
+            self.log(f"Preview (P): {os.path.basename(wt_path)} | pos={pos:.2f} mip={mip:.2f}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Preview error", str(e))
+            self.log(f"ERROR preview: {e}")
+
+    # ---------- File dialogs ----------
     def browse_src(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Seleccionar audio fuente", "", "Audio files (*.wav *.flac *.ogg *.mp3);;Todos (*.*)"
@@ -610,11 +825,15 @@ class MainWindow(QMainWindow):
             self.src_edit.setText(path)
 
     def browse_wt(self):
+        start = self.wt_dir_edit.text().strip() or WT_DIR_DEFAULT
         path, _ = QFileDialog.getOpenFileName(
-            self, "Seleccionar wavetable WAV", "", "WAV (*.wav);;Todos (*.*)"
+            self, "Seleccionar wavetable WAV", start, "WAV (*.wav);;Todos (*.*)"
         )
         if path:
             self.wt_edit.setText(path)
+            # invalidar cache
+            self._wt_cache_path = None
+            self._wt_cache_mipmaps = None
 
     def browse_out(self):
         path, _ = QFileDialog.getSaveFileName(
@@ -623,9 +842,7 @@ class MainWindow(QMainWindow):
         if path:
             self.out_edit.setText(path)
 
-    def log(self, msg: str):
-        self.logs.append(msg)
-
+    # ---------- Processing ----------
     def start_processing(self):
         src = self.src_edit.text().strip()
         outp = self.out_edit.text().strip()
@@ -633,6 +850,9 @@ class MainWindow(QMainWindow):
 
         if not src or not outp:
             QMessageBox.warning(self, "Falta info", "Selecciona audio fuente y ruta de salida.")
+            return
+        if not wt:
+            QMessageBox.warning(self, "Falta wavetable", "Selecciona un wavetable WAV.")
             return
 
         hop = int(self.hop_spin.value())
@@ -699,4 +919,5 @@ if __name__ == "__main__":
     w = MainWindow()
     w.show()
     sys.exit(app.exec())
+
 
